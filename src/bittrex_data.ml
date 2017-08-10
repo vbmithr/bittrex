@@ -6,6 +6,7 @@ open Log.Global
 open Cohttp_async
 
 open Bs_devkit
+open Bittrex
 module REST = Bittrex_async
 module DTC = Dtc_pb.Dtcprotocol_piqi
 
@@ -61,14 +62,14 @@ module CtrlFile = struct
         if i >= 0 then begin
             if not (Bitv.get bitv i) || latest then
               begin fun () -> f ~start_ts ~end_ts >>| function
-                | Error err -> error "%s" (REST.Http_error.to_string err)
+                | Error err -> error "%s" (REST.RestError.to_string err)
                 | Ok _ -> Bitv.set bitv i true
               end :: thunks
             else thunks
           end
         else begin fun () ->
           f ~start_ts ~end_ts >>| Result.iter_error ~f:begin fun err ->
-            error "%s" (REST.Http_error.to_string err)
+            error "%s" (REST.RestError.to_string err)
           end
         end :: thunks
       in
@@ -79,11 +80,10 @@ end
 
 module Instrument = struct
   type t = {
-    db : DB.db ;
-    ctrl : CtrlFile.t ;
+    db : DB.db
   }
 
-  let create ~db ~ctrl = { db ; ctrl }
+  let create ~db = { db }
 
   let ( // ) = Filename.concat
 
@@ -91,22 +91,21 @@ module Instrument = struct
   let set_datadir d = datadir := d
 
   let db_path symbol =
-    !datadir // "db" // symbol
-
-  let ctrl_path symbol =
-    !datadir // "ctrl" // symbol
+    !datadir // symbol
 
   let load symbols =
     Deferred.Result.bind
-      (REST.symbols ~log:(Lazy.force log) ()) ~f:begin fun all_symbols ->
+      (REST.markets ~log:(Lazy.force log) ()) ~f:begin fun (resp, markets) ->
+      let markets =
+        List.fold_left markets ~init:String.Set.empty
+          ~f:(fun a { Market.base ; quote } -> String.Set.add a (base ^ "-" ^ quote)) in
       let symbols_in_use =
-        if String.Set.is_empty symbols then all_symbols
-        else String.Set.(inter (of_list all_symbols) symbols |> to_list) in
-      List.map symbols_in_use ~f:begin fun symbol ->
+        if String.Set.is_empty symbols then markets
+        else String.Set.inter markets symbols in
+      String.Set.fold symbols_in_use ~init:[] ~f:begin fun a symbol ->
         let db = DB.open_db (db_path symbol) in
-        let ctrl = CtrlFile.open_file (ctrl_path symbol) in
         info "Loaded instrument %s" symbol ;
-        symbol, create ~db ~ctrl
+        (symbol, create ~db) :: a
       end |> fun res ->
       return (Ok res)
     end
@@ -123,13 +122,8 @@ module Instrument = struct
       end
     end
 
-  let thunks_exn ?start symbol f =
-    let { ctrl } = find_exn symbol in
-    CtrlFile.jobs ?start ctrl f
-
-  let close { db ; ctrl } =
-    DB.close db ;
-    CtrlFile.close ctrl
+  let close { db } =
+    DB.close db
 
   let shutdown () =
     let nb_closed =
@@ -142,9 +136,12 @@ end
 
 let dry_run = ref false
 
+let time_ns_of_ptime t = Time_ns.of_string (Ptime.to_rfc3339 t)
+
 let mk_store_trade_in_db () =
   let tss = String.Table.create () in
-  fun symbol { Trade.ts; price; qty; side } ->
+  fun symbol { MarketHistory.timestamp ; price; qty; side } ->
+    let ts = time_ns_of_ptime timestamp in
     if !dry_run || side = `buy_sell_unset then ()
     else
       let { Instrument.db } = Instrument.find_exn symbol in
@@ -239,19 +236,33 @@ module Granulator = struct
       end
 end
 
-let pump symbol ~start_ts ~end_ts =
-  REST.trades ~log:(Lazy.force log) ~start_ts ~end_ts symbol >>= function
+let pump symbol =
+  REST.markethistory symbol >>= function
   | Error err -> return (Error err)
-  | Ok trades ->
-    Pipe.fold_without_pushback trades
-      ~init:(0, Time_ns.max_value) ~f:begin fun (nb_trades, last_ts) t ->
+  | Ok (resp, trades) ->
+    let nb_trades, first_ts, last_ts = List.fold_left trades
+        ~init:(0, Ptime.max, Ptime.min)
+        ~f:begin fun (nb_trades, first_ts, last_ts) t ->
       store_trade_in_db symbol t ;
-      succ nb_trades, t.ts
-    end >>= fun (nb_trades, last_ts) ->
-    debug "pumped %d trades from %s to %s" nb_trades
-      (Time_ns.to_string start_ts) (Time_ns.to_string end_ts) ;
+      succ nb_trades,
+      min first_ts t.timestamp,
+      max last_ts t.timestamp
+    end in
+    debug "%s: pumped %d trades from %s to %s" symbol nb_trades
+      (Ptime.to_rfc3339 first_ts) (Ptime.to_rfc3339 last_ts) ;
     Clock_ns.after (Time_ns.Span.of_int_ms 167) >>| fun () ->
     Ok ()
+
+let pump_forever span symbols =
+  Clock_ns.every span ~continue_on_error:true begin fun () ->
+    don't_wait_for begin
+      Deferred.List.iter symbols ~how:`Sequential ~f:begin fun symbol ->
+        pump symbol >>| function
+        | Ok () -> ()
+        | Error err -> error "%s" (REST.RestError.to_string err)
+      end
+    end
+  end
 
 (* A DTC Historical Price Server. *)
 
@@ -471,20 +482,14 @@ let dtcserver ~server ~port =
 let run ?start port no_pump symbols =
   Instrument.load symbols >>= function
   | Error err ->
-    error "%s" (REST.Http_error.to_string err) ;
+    error "%s" (REST.RestError.to_string err) ;
     Deferred.unit
   | Ok symbols ->
     info "Data server starting";
     dtcserver ~server:`TCP ~port >>= fun server ->
-    Deferred.all_unit [
-      Tcp.Server.close_finished server ;
-      if no_pump then Deferred.unit
-      else
-        let thunks = List.fold_left symbols ~init:[] ~f:begin fun a symbol ->
-          List.rev_append (Instrument.thunks_exn ?start symbol (pump symbol)) a
-        end in
-        Deferred.List.iter thunks ~how:`Sequential ~f:(fun f -> f ())
-    ]
+    if not no_pump then
+      pump_forever (Time_ns.Span.of_int_sec 600) symbols ;
+    Tcp.Server.close_finished server
 
 let main dry_run' no_pump start port daemon datadir pidfile logfile loglevel symbols () =
   dry_run := dry_run';
@@ -499,6 +504,7 @@ let main dry_run' no_pump start port daemon datadir pidfile logfile loglevel sym
     end
   end ;
   stage begin fun `Scheduler_started ->
+    Core.Unix.RLimit.(set num_file_descriptors { cur = Limit 4096L ; max = Limit 4096L }) ;
     Lock_file.create_exn pidfile >>= fun () ->
     Writer.open_file ~append:true logfile >>= fun log_writer ->
     set_output Log.Output.[stderr (); writer `Text log_writer];
@@ -512,11 +518,11 @@ let command =
     +> flag "-dry-run" no_arg ~doc:" Do not write trades in DBs"
     +> flag "-no-pump" no_arg ~doc:" Do not pump trades"
     +> flag "-start" (optional date) ~doc:"float Start gathering history N days in the past (default: use start file)"
-    +> flag "-port" (optional_with_default 5574 int) ~doc:"int TCP port to use (5574)"
+    +> flag "-port" (optional_with_default 5576 int) ~doc:"int TCP port to use (5576)"
     +> flag "-daemon" no_arg ~doc:" Run as a daemon"
-    +> flag "-datadir" (optional_with_default (Filename.concat "data" "poloniex") string) ~doc:"path Where to store DBs (data)"
-    +> flag "-pidfile" (optional_with_default (Filename.concat "run" "plnx_data.pid") string) ~doc:"filename Path of the pid file (run/plnx_data.pid)"
-    +> flag "-logfile" (optional_with_default (Filename.concat "log" "plnx_data.log") string) ~doc:"filename Path of the log file (log/plnx_data.log)"
+    +> flag "-datadir" (optional_with_default (Filename.concat "data" "bittrex") string) ~doc:"path Where to store DBs (data)"
+    +> flag "-pidfile" (optional_with_default (Filename.concat "run" "bittrex_data.pid") string) ~doc:"filename Path of the pid file (run/bittrex_data.pid)"
+    +> flag "-logfile" (optional_with_default (Filename.concat "log" "bittrex_data.log") string) ~doc:"filename Path of the log file (log/bittrex_data.log)"
     +> flag "-loglevel" (optional_with_default 1 int) ~doc:"1-3 loglevel"
     +> anon (sequence ("symbol" %: string))
   in
