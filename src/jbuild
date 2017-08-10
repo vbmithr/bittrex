@@ -1,0 +1,5 @@
+(executables
+ ((names (bittrex bittrex_data))
+  (public_names (bittrex bittrex-data))
+  (preprocess (pps (ppx_sexp_conv)))
+  (libraries (bitv bs-devkit leveldb tick dtc-pb bittrex-async))))
