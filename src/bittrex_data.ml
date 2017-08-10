@@ -521,8 +521,8 @@ let command =
     +> flag "-port" (optional_with_default 5576 int) ~doc:"int TCP port to use (5576)"
     +> flag "-daemon" no_arg ~doc:" Run as a daemon"
     +> flag "-datadir" (optional_with_default (Filename.concat "data" "bittrex") string) ~doc:"path Where to store DBs (data)"
-    +> flag "-pidfile" (optional_with_default (Filename.concat "run" "bittrex_data.pid") string) ~doc:"filename Path of the pid file (run/bittrex_data.pid)"
-    +> flag "-logfile" (optional_with_default (Filename.concat "log" "bittrex_data.log") string) ~doc:"filename Path of the log file (log/bittrex_data.log)"
+    +> flag "-pidfile" (optional_with_default (Filename.concat "run" "btrex_data.pid") string) ~doc:"filename Path of the pid file (run/btrex_data.pid)"
+    +> flag "-logfile" (optional_with_default (Filename.concat "log" "btrex_data.log") string) ~doc:"filename Path of the log file (log/btrex_data.log)"
     +> flag "-loglevel" (optional_with_default 1 int) ~doc:"1-3 loglevel"
     +> anon (sequence ("symbol" %: string))
   in

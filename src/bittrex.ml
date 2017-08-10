@@ -37,13 +37,13 @@ let conduit_server ~tls ~crt_path ~key_path =
   else
   return `TCP
 
-let my_exchange = "PLNX"
+let my_exchange = "BTREX"
 let exchange_account = "exchange"
 let margin_account = "margin"
 let update_client_span = ref @@ Time_ns.Span.of_int_sec 30
 let sc_mode = ref false
 
-let log_plnx =
+let log_bttrex =
   Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[stderr ()]
 let log_dtc =
   Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[stderr ()]
@@ -236,7 +236,7 @@ module Connection = struct
   let update_positions { addr; w; key; secret; positions } =
     Rest.margin_positions ~buf:buf_json ~key ~secret () >>| function
     | Error err ->
-      Log.error log_plnx "update positions (%s): %s"
+      Log.error log_bttrex "update positions (%s): %s"
         addr @@ Rest.Http_error.to_string err
     | Ok ps -> List.iter ps ~f:begin fun (symbol, p) ->
         match p with
@@ -251,7 +251,7 @@ module Connection = struct
   let update_orders { addr ; key; secret; orders } =
     Rest.open_orders ~buf:buf_json ~key ~secret () >>| function
     | Error err ->
-      Log.error log_plnx
+      Log.error log_btrex
         "update orders (%s): %s" addr @@ Rest.Http_error.to_string err
     | Ok os ->
       Int.Table.clear orders;
@@ -265,7 +265,7 @@ module Connection = struct
   let update_trades { addr; key; secret; trades } =
     Rest.trade_history ~buf:buf_json ~key ~secret () >>| function
     | Error err ->
-      Log.error log_plnx
+      Log.error log_btrex
         "update trades (%s): %s" addr (Rest.Http_error.to_string err)
     | Ok ts ->
       List.iter ts ~f:begin fun (symbol, ts) ->
@@ -328,13 +328,13 @@ module Connection = struct
   let update_margin ({ key ; secret } as conn) =
     Rest.margin_account_summary ~buf:buf_json ~key ~secret () >>| function
     | Error err ->
-      Log.error log_plnx "%s" @@ Rest.Http_error.to_string err
+      Log.error log_btrex "%s" @@ Rest.Http_error.to_string err
     | Ok m ->
       conn.margin <- m
 
   let update_positive_balances ({ key ; secret ; b_margin } as conn) =
     Rest.positive_balances ~buf:buf_json ~key ~secret () >>| function
-    | Error err -> Log.error log_plnx "%s" @@ Rest.Http_error.to_string err
+    | Error err -> Log.error log_btrex "%s" @@ Rest.Http_error.to_string err
     | Ok bs ->
       String.Table.clear b_margin;
       List.Assoc.find ~equal:(=) bs Margin |>
@@ -345,7 +345,7 @@ module Connection = struct
 
   let update_balances ({ key ; secret ; b_exchange } as conn) =
     Rest.balances ~buf:buf_json ~all:false ~key ~secret () >>| function
-    | Error err -> Log.error log_plnx "%s" @@ Rest.Http_error.to_string err
+    | Error err -> Log.error log_btrex "%s" @@ Rest.Http_error.to_string err
     | Ok bs ->
       String.Table.clear b_exchange;
       List.iter bs ~f:(fun (c, b) -> String.Table.add_exn b_exchange c b) ;
@@ -459,7 +459,7 @@ let update_tickers () =
   let now = Time_ns.now () in
   Rest.tickers () >>| function
   | Error err ->
-    Log.error log_plnx "get tickers: %s" (Rest.Http_error.to_string err)
+    Log.error log_btrex "get tickers: %s" (Rest.Http_error.to_string err)
   | Ok ts ->
     List.iter ts ~f:begin fun t ->
       let old_ts, old_t =
@@ -489,7 +489,7 @@ let at_bid_or_ask_of_trade : Side.t -> DTC.at_bid_or_ask_enum = function
   | `buy_sell_unset -> `bid_ask_unset
 
 let on_trade_update pair ({ Trade.ts; side; price; qty } as t) =
-  Log.debug log_plnx "<- %s %s" pair (Trade.sexp_of_t t |> Sexplib.Sexp.to_string);
+  Log.debug log_btrex "<- %s %s" pair (Trade.sexp_of_t t |> Sexplib.Sexp.to_string);
   (* Send trade updates to subscribers. *)
   let on_connection { Connection.addr; w; subs; _} =
     let on_symbol_id symbol_id =
@@ -575,7 +575,7 @@ let ws ?heartbeat timeout =
     latest_ts := now ;
     match msg with
     | Ws.Repr.Error msg ->
-      Log.error log_plnx "[WS]: %s" msg
+      Log.error log_btrex "[WS]: %s" msg
     | Event { subid ; id ; events } ->
       if not !initialized then begin
         let symbols = String.Table.keys tickers in
@@ -588,7 +588,7 @@ let ws ?heartbeat timeout =
   in
   let connected = Condition.create () in
   let restart, ws =
-    Ws.open_connection ?heartbeat ~log:log_plnx ~connected to_ws in
+    Ws.open_connection ?heartbeat ~log:log_btrex ~connected to_ws in
   let rec handle_init () =
     Condition.wait connected >>= fun () ->
     initialized := false ;
@@ -602,7 +602,7 @@ let ws ?heartbeat timeout =
   Clock_ns.every timeout watchdog ;
   Monitor.handle_errors
     (fun () -> Pipe.iter_without_pushback ~continue_on_error:true ws ~f:on_msg)
-    (fun exn -> Log.error log_plnx "%s" @@ Exn.to_string exn)
+    (fun exn -> Log.error log_btrex "%s" @@ Exn.to_string exn)
 
 let heartbeat addr w ival =
   let ival = Option.value_map ival ~default:60 ~f:Int32.to_int_exn in
@@ -1480,7 +1480,7 @@ let dtcserver ~server ~port =
 let loglevel_of_int = function 2 -> `Info | 3 -> `Debug | _ -> `Error
 
 let main update_client_span' heartbeat timeout tls port
-    daemon pidfile logfile loglevel ll_dtc ll_plnx crt_path key_path sc () =
+    daemon pidfile logfile loglevel ll_dtc ll_btrex crt_path key_path sc () =
   let timeout = Time_ns.Span.of_string timeout in
   sc_mode := sc ;
   update_client_span := Time_ns.Span.of_string update_client_span';
@@ -1492,14 +1492,14 @@ let main update_client_span' heartbeat timeout tls port
   in
 
   Log.set_level log_dtc @@ loglevel_of_int @@ max loglevel ll_dtc;
-  Log.set_level log_plnx @@ loglevel_of_int @@ max loglevel ll_plnx;
+  Log.set_level log_btrex @@ loglevel_of_int @@ max loglevel ll_btrex;
 
   if daemon then Daemon.daemonize ~cd:"." ();
   stage begin fun `Scheduler_started ->
     Lock_file.create_exn pidfile >>= fun () ->
     Writer.open_file ~append:true logfile >>= fun log_writer ->
     Log.(set_output log_dtc Output.[stderr (); writer `Text log_writer]);
-    Log.(set_output log_plnx Output.[stderr (); writer `Text log_writer]);
+    Log.(set_output log_btrex Output.[stderr (); writer `Text log_writer]);
 
     let now = Time_ns.now () in
     Rest.currencies () >>| begin function
@@ -1531,11 +1531,11 @@ let command =
     +> flag "-tls" no_arg ~doc:" Use TLS"
     +> flag "-port" (optional_with_default 5573 int) ~doc:"int TCP port to use (5573)"
     +> flag "-daemon" no_arg ~doc:" Run as a daemon"
-    +> flag "-pidfile" (optional_with_default "run/plnx.pid" string) ~doc:"filename Path of the pid file (run/plnx.pid)"
-    +> flag "-logfile" (optional_with_default "log/plnx.log" string) ~doc:"filename Path of the log file (log/plnx.log)"
+    +> flag "-pidfile" (optional_with_default "run/btrex.pid" string) ~doc:"filename Path of the pid file (run/btrex.pid)"
+    +> flag "-logfile" (optional_with_default "log/btrex.log" string) ~doc:"filename Path of the log file (log/btrex.log)"
     +> flag "-loglevel" (optional_with_default 2 int) ~doc:"1-3 global loglevel"
     +> flag "-loglevel-dtc" (optional_with_default 2 int) ~doc:"1-3 loglevel for DTC"
-    +> flag "-loglevel-plnx" (optional_with_default 2 int) ~doc:"1-3 loglevel for PLNX"
+    +> flag "-loglevel-btrex" (optional_with_default 2 int) ~doc:"1-3 loglevel for BTREX"
     +> flag "-crt-file" (optional_with_default "ssl/bitsouk.com.crt" string) ~doc:"filename crt file to use (TLS)"
     +> flag "-key-file" (optional_with_default "ssl/bitsouk.com.key" string) ~doc:"filename key file to use (TLS)"
     +> flag "-sc" no_arg ~doc:" Sierra Chart mode."
