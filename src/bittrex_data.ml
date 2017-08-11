@@ -242,9 +242,7 @@ end
 module TSet = Caml.Set.Make(MarketHistory)
 
 let pump cache symbol =
-  REST.markethistory symbol >>= function
-  | Error err -> return (Error err)
-  | Ok (resp, trades) ->
+  REST.markethistory symbol >>| Result.map ~f:begin fun (resp, trades) ->
     let trades =
       List.fold_left trades ~init:TSet.empty ~f:(fun a e -> TSet.add e a) in
     let new_trades = TSet.diff trades cache in
@@ -260,8 +258,8 @@ let pump cache symbol =
     in
     debug "%s: pumped %d trades from %s to %s" symbol nb_trades
       (Ptime.to_rfc3339 first_ts) (Ptime.to_rfc3339 last_ts) ;
-    Clock_ns.after (Time_ns.Span.of_int_ms 167) >>| fun () ->
-    Ok new_trades
+    new_trades
+  end
 
 let pump_forever big_period_int symbols =
   let caches = String.Table.create () in
