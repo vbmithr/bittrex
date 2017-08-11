@@ -136,7 +136,10 @@ end
 
 let dry_run = ref false
 
-let time_ns_of_ptime t = Time_ns.of_string (Ptime.to_rfc3339 t)
+let time_ns_of_ptime t =
+  Ptime.to_float_s t |> fun s ->
+  Int.of_float (s *. 1e9) |>
+  Time_ns.of_int_ns_since_epoch
 
 let mk_store_trade_in_db () =
   let tss = String.Table.create () in
@@ -236,29 +239,40 @@ module Granulator = struct
       end
 end
 
-let pump symbol =
+module TSet = Caml.Set.Make(MarketHistory)
+
+let pump cache symbol =
   REST.markethistory symbol >>= function
   | Error err -> return (Error err)
   | Ok (resp, trades) ->
-    let nb_trades, first_ts, last_ts = List.fold_left trades
-        ~init:(0, Ptime.max, Ptime.min)
-        ~f:begin fun (nb_trades, first_ts, last_ts) t ->
-      store_trade_in_db symbol t ;
-      succ nb_trades,
-      min first_ts t.timestamp,
-      max last_ts t.timestamp
-    end in
+    let trades =
+      List.fold_left trades ~init:TSet.empty ~f:(fun a e -> TSet.add e a) in
+    let new_trades = TSet.diff trades cache in
+    let nb_trades, first_ts, last_ts = TSet.fold
+        begin fun t (nb_trades, first_ts, last_ts) ->
+          store_trade_in_db symbol t ;
+          succ nb_trades,
+          min first_ts t.timestamp,
+          max last_ts t.timestamp
+        end
+        new_trades
+        (0, Ptime.max, Ptime.min)
+    in
     debug "%s: pumped %d trades from %s to %s" symbol nb_trades
       (Ptime.to_rfc3339 first_ts) (Ptime.to_rfc3339 last_ts) ;
     Clock_ns.after (Time_ns.Span.of_int_ms 167) >>| fun () ->
-    Ok ()
+    Ok new_trades
 
 let pump_forever span symbols =
+  let caches = String.Table.create () in
+  List.iter symbols ~f:(fun symbol -> String.Table.set caches symbol TSet.empty) ;
   Clock_ns.every span ~continue_on_error:true begin fun () ->
     don't_wait_for begin
       Deferred.List.iter symbols ~how:`Sequential ~f:begin fun symbol ->
-        pump symbol >>| function
-        | Ok () -> ()
+        let cache = String.Table.find_exn caches symbol in
+        pump cache symbol >>| function
+        | Ok new_cache ->
+          String.Table.set caches symbol new_cache
         | Error err -> error "%s" (REST.RestError.to_string err)
       end
     end
