@@ -263,19 +263,26 @@ let pump cache symbol =
     Clock_ns.after (Time_ns.Span.of_int_ms 167) >>| fun () ->
     Ok new_trades
 
-let pump_forever symbols =
+let pump_forever big_period_int symbols =
   let caches = String.Table.create () in
-  List.iter symbols ~f:(fun symbol -> String.Table.set caches symbol TSet.empty) ;
-  let rec inner () =
-    Deferred.List.iter symbols ~how:`Sequential ~f:begin fun symbol ->
+  let nb_symbols = List.length symbols in
+  let big_period = Time_ns.Span.of_int_sec big_period_int in
+  let small_period = big_period_int // nb_symbols |> Time_ns.Span.of_sec in
+  List.fold_left symbols ~init:Time_ns.Span.zero ~f:begin fun start symbol ->
+    String.Table.set caches symbol TSet.empty ;
+    let span = Time_ns.Span.(start + small_period) in
+    let start = Clock_ns.after span in
+    Clock_ns.every big_period ~start ~continue_on_error:true begin fun () ->
       let cache = String.Table.find_exn caches symbol in
-      pump cache symbol >>| function
-      | Ok new_cache ->
-        String.Table.set caches symbol new_cache
-      | Error err -> error "%s" (REST.RestError.to_string err)
-    end >>=
-    inner
-  in inner ()
+      don't_wait_for begin
+        pump cache symbol >>| function
+        | Ok new_cache ->
+          String.Table.set caches symbol new_cache
+        | Error err -> error "%s" (REST.RestError.to_string err)
+      end
+    end ;
+    span
+  end |> ignore
 
 (* A DTC Historical Price Server. *)
 
@@ -500,10 +507,9 @@ let run ?start port no_pump symbols =
   | Ok symbols ->
     info "Data server starting";
     dtcserver ~server:`TCP ~port >>= fun server ->
-    Deferred.all_unit [
-      if no_pump then Deferred.unit else pump_forever symbols ;
-      Tcp.Server.close_finished server
-    ]
+    if not no_pump then
+      pump_forever 20 symbols ;
+    Tcp.Server.close_finished server
 
 let main dry_run' no_pump start port daemon datadir pidfile logfile loglevel symbols () =
   dry_run := dry_run';
