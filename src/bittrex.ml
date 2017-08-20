@@ -40,8 +40,6 @@ let conduit_server ~tls ~crt_path ~key_path =
   return `TCP
 
 let my_exchange = "BTREX"
-let exchange_account = "exchange"
-let margin_account = "margin"
 let update_client_span = ref @@ Time_ns.Span.of_int_sec 30
 let sc_mode = ref false
 
@@ -53,7 +51,8 @@ let log_dtc =
 let subid_to_sym : String.t Int.Table.t = Int.Table.create ()
 
 let currencies : Currency.t String.Table.t = String.Table.create ()
-let tickers : (Time_ns.t * Ticker.t) String.Table.t = String.Table.create ()
+let marketsummaries :
+  (Time_ns.t * MarketSummary.t) String.Table.t = String.Table.create ()
 
 module Book = struct
   type t = {
@@ -80,25 +79,40 @@ let latest_trades : MarketHistory.t String.Table.t = String.Table.create ()
 
 let buf_json = Bi_outbuf.create 4096
 
-let secdef_of_ticker ?request_id ?(final=true)
-    ({ symbol; quote; base; quote_descr; base_descr; ticksize; active; created } : Market.t) =
-  let description = quote_descr ^ " / " ^ base_descr in
-  let request_id = match request_id with
-    | Some reqid -> reqid
-    | None when !sc_mode -> 110_000_000l
-    | None -> 0l in
-  let secdef = DTC.default_security_definition_response () in
-  secdef.request_id <- Some request_id ;
-  secdef.is_final_message <- Some final ;
-  secdef.symbol <- Some symbol ;
-  secdef.exchange <- Some my_exchange ;
-  secdef.security_type <- Some `security_type_forex ;
-  secdef.description <- Some description ;
-  secdef.min_price_increment <- Some 1e-8 ;
-  secdef.currency_value_per_increment <- Some 1e-8 ;
-  secdef.price_display_format <- Some `price_display_format_decimal_8 ;
-  secdef.has_market_depth_data <- Some true ;
-  secdef
+module Instrument = struct
+  let secdefs :
+    DTC.Security_definition_response.t String.Table.t = String.Table.create ()
+
+  let secdef_of_market ?request_id ?(final=true)
+      ({ symbol; quote; base; quote_descr;
+         base_descr; ticksize; active; created } : Market.t) =
+    let description = quote_descr ^ " / " ^ base_descr in
+    let request_id = match request_id with
+      | Some reqid -> reqid
+      | None when !sc_mode -> 110_000_000l
+      | None -> 0l in
+    let secdef = DTC.default_security_definition_response () in
+    secdef.request_id <- Some request_id ;
+    secdef.is_final_message <- Some final ;
+    secdef.symbol <- Some symbol ;
+    secdef.exchange <- Some my_exchange ;
+    secdef.security_type <- Some `security_type_forex ;
+    secdef.description <- Some description ;
+    secdef.min_price_increment <- Some 1e-8 ;
+    secdef.currency_value_per_increment <- Some 1e-8 ;
+    secdef.price_display_format <- Some `price_display_format_decimal_8 ;
+    secdef.has_market_depth_data <- Some true ;
+    secdef
+
+  let init () =
+    markets ~buf:buf_json ~log:log_btrex () >>| function
+    | Error e ->
+      Log.error log_btrex "%s" (RestError.to_string e)
+    | Ok (resp, markets) ->
+      List.iter markets ~f:begin fun m ->
+        String.Table.set secdefs m.symbol (secdef_of_market m)
+      end
+end
 
 module RestSync : sig
   type t
@@ -207,8 +221,7 @@ module Connection = struct
     subs_depth: Int32.t String.Table.t;
     rev_subs_depth : string Int32.Table.t;
     (* Balances *)
-    b_exchange: Balance.t String.Table.t;
-    b_margin: Float.t String.Table.t;
+    balances : Balance.t String.Table.t ;
     (* Orders & Trades *)
     client_orders : DTC.Submit_new_single_order.t Int.Table.t ;
     mutable orders: RespObj.t Uuid.Table.t;
@@ -247,40 +260,31 @@ module Connection = struct
       c.trades <- ROSet.to_table cur_ts ;
       ROSet.iter ignore new_ts (* TODO: send order update messages *)
 
-  let write_balance
-      ?request_id
-      ?(nb_msgs=1)
-      ?(msg_number=1) { addr; w; b_exchange } =
-    let b = String.Table.find b_exchange "BTC" |>
-            Option.map ~f:begin fun { Rest.Balance.available; on_orders } ->
-              available *. 1e3, (available -. on_orders) *. 1e3
-            end
-    in
-    let securities_value =
-      String.Table.fold b_exchange ~init:0.
-        ~f:begin fun ~key:_ ~data:{ Rest.Balance.btc_value } a ->
-          a +. btc_value end *. 1e3 in
-    let balance = DTC.default_account_balance_update () in
-    balance.request_id <- request_id ;
-    balance.cash_balance <- Option.map b ~f:fst ;
-    balance.securities_value <- Some securities_value ;
-    balance.margin_requirement <- Some 0. ;
-    balance.balance_available_for_new_positions <- Option.map b ~f:snd ;
-    balance.account_currency <- Some "mBTC" ;
-    balance.total_number_messages <- Int32.of_int nb_msgs ;
-    balance.message_number <- Int32.of_int msg_number ;
-    balance.trade_account <- Some exchange_account ;
-    write_message w `account_balance_update DTC.gen_account_balance_update balance ;
+  let write_balance ?request_id ?(nb_msgs=1) ?(msg_number=1)
+      { addr ; w } { Balance.balance ; currency } =
+    let b = DTC.default_account_balance_update () in
+    b.request_id <- request_id ;
+    b.cash_balance <- Some balance ;
+    b.securities_value <- Some 0. ;
+    b.margin_requirement <- Some 0. ;
+    b.balance_available_for_new_positions <- Some balance ;
+    b.account_currency <- Some currency ;
+    b.total_number_messages <- Int32.of_int nb_msgs ;
+    b.message_number <- Int32.of_int msg_number ;
+    write_message w `account_balance_update DTC.gen_account_balance_update b ;
     Log.debug log_dtc "-> %s AccountBalanceUpdate %s (%d/%d)"
-      addr exchange_account msg_number nb_msgs
+      addr currency msg_number nb_msgs
 
-  let update_balances ({ key ; secret ; b_exchange } as conn) =
-    balances ~buf:buf_json ~all:false ~key ~secret () >>| function
-    | Error err -> Log.error log_btrex "%s" @@ Rest.Http_error.to_string err
-    | Ok bs ->
-      String.Table.clear b_exchange;
-      List.iter bs ~f:(fun (c, b) -> String.Table.add_exn b_exchange c b) ;
-      write_exchange_balance conn
+  let update_balances ({ key ; secret ; balances } as conn) =
+    Btrex_async.balances ~buf:buf_json ~key ~secret () >>| function
+    | Error err ->
+      Log.error log_btrex "%s" @@ RestError.to_string err
+    | Ok (resp, new_balances) ->
+      String.Table.clear balances ;
+      List.iter new_balances ~f:begin fun b ->
+        String.Table.set balances b.currency b ;
+        write_balance conn b
+      end
 
   let update_connection conn span =
     Clock_ns.every
@@ -306,8 +310,7 @@ module Connection = struct
       rev_subs = Int32.Table.create () ;
       subs_depth = String.Table.create () ;
       rev_subs_depth = Int32.Table.create () ;
-      b_exchange = String.Table.create () ;
-      b_margin = String.Table.create () ;
+      balances = String.Table.create () ;
       client_orders = Int.Table.create () ;
       orders = Uuid.Table.create () ;
       trades = Uuid.Table.create () ;
@@ -315,7 +318,7 @@ module Connection = struct
     set ~key:addr ~data:conn ;
     if key = "" || secret = "" then Deferred.return false
     else begin
-      Rest.margin_account_summary ~buf:buf_json ~key ~secret () >>| function
+      balances ~buf:buf_json ~key ~secret () >>| function
       | Error _ -> false
       | Ok _ ->
         update_connection conn !update_client_span ;
@@ -323,37 +326,37 @@ module Connection = struct
     end
 end
 
-let send_update_msgs depth symbol_id w ts (t:Ticker.t) (t':Ticker.t) =
+let send_update_msgs depth symbol_id w ts (t:MarketSummary.t) (t':MarketSummary.t) =
   if t.base_volume <> t'.base_volume then begin
     let update = DTC.default_market_data_update_session_volume () in
     update.symbol_id <- Some symbol_id ;
-    update.volume <- Some (t'.base_volume) ;
+    update.volume <- Some t'.base_volume ;
     write_message w `market_data_update_session_volume
       DTC.gen_market_data_update_session_volume update
   end;
-  if t.low24h <> t'.low24h then begin
+  if t.low <> t'.low then begin
     let update = DTC.default_market_data_update_session_low () in
     update.symbol_id <- Some symbol_id ;
-    update.price <- Some (t'.low24h) ;
+    update.price <- Some t'.low ;
     write_message w `market_data_update_session_low
       DTC.gen_market_data_update_session_low update
   end;
-  if t.high24h <> t'.high24h then begin
+  if t.high <> t'.high then begin
     let update = DTC.default_market_data_update_session_high () in
     update.symbol_id <- Some symbol_id ;
-    update.price <- Some (t'.high24h) ;
+    update.price <- Some t'.high ;
     write_message w `market_data_update_session_high
       DTC.gen_market_data_update_session_high update
   end;
-  (* if t.last <> t'.last then begin *)
-  (*   let float_of_ts ts = Time_ns.to_int_ns_since_epoch ts |> Float.of_int |> fun date -> date /. 1e9 in *)
-  (*   let update = DTC.default_market_data_update_last_trade_snapshot () in *)
-  (*   update.symbol_id <- Some symbol_id ; *)
-  (*   update.last_trade_date_time <- Some (float_of_ts ts) ; *)
-  (*   update.last_trade_price <- Some (t'.last) ; *)
-  (*   write_message w `market_data_update_last_trade_snapshot *)
-  (*     DTC.gen_market_data_update_last_trade_snapshot update *)
-  (* end; *)
+  if t.last <> t'.last then begin
+    let float_of_ts ts = Time_ns.to_int_ns_since_epoch ts |> Float.of_int |> fun date -> date /. 1e9 in
+    let update = DTC.default_market_data_update_last_trade_snapshot () in
+    update.symbol_id <- Some symbol_id ;
+    update.last_trade_date_time <- Some (float_of_ts ts) ;
+    update.last_trade_price <- Some t'.last ;
+    write_message w `market_data_update_last_trade_snapshot
+      DTC.gen_market_data_update_last_trade_snapshot update
+  end;
   if (t.bid <> t'.bid || t.ask <> t'.ask) && not depth then begin
     let update = DTC.default_market_data_update_bid_ask () in
     update.symbol_id <- Some symbol_id ;
@@ -363,17 +366,12 @@ let send_update_msgs depth symbol_id w ts (t:Ticker.t) (t':Ticker.t) =
       DTC.gen_market_data_update_bid_ask update
   end
 
-let on_ticker_update ts t t' =
-  let send_secdef_msg w t =
-    let secdef = secdef_of_ticker ~final:true t in
-    write_message w `security_definition_response
-      DTC.gen_security_definition_response secdef in
+let on_marketsummary_update ts t t' =
   let on_connection { Connection.addr; w; subs; subs_depth; send_secdefs } =
     let on_symbol_id ?(depth=false) symbol_id =
       send_update_msgs depth symbol_id w ts t t';
-      Log.debug log_dtc "-> [%s] %s TICKER" addr t.symbol
+      Log.debug log_dtc "-> [%s] %s market summary" addr t.symbol
     in
-    if send_secdefs && phys_equal t t' then send_secdef_msg w t ;
     match String.Table.(find subs t.symbol, find subs_depth t.symbol) with
     | Some sym_id, None -> on_symbol_id ~depth:false sym_id
     | Some sym_id, _ -> on_symbol_id ~depth:true sym_id
@@ -381,24 +379,24 @@ let on_ticker_update ts t t' =
   in
   Connection.iter ~f:on_connection
 
-let update_tickers () =
+let update_mss () =
   let now = Time_ns.now () in
-  Rest.tickers () >>| function
+  Btrex_async.marketsummaries () >>| function
   | Error err ->
-    Log.error log_btrex "get tickers: %s" (Rest.Http_error.to_string err)
-  | Ok ts ->
-    List.iter ts ~f:begin fun t ->
-      let old_ts, old_t =
-        String.Table.find_or_add tickers t.symbol ~default:(fun () -> (now, t)) in
-      String.Table.set tickers t.symbol (now, t) ;
-      on_ticker_update now old_t t ;
+    Log.error log_btrex "get market summaries: %s" (RestError.to_string err)
+  | Ok (resp, mss) ->
+    List.iter mss ~f:begin fun ms ->
+      let old_ts, old_ms =
+        String.Table.find_or_add marketsummaries ms.symbol ~default:(fun () -> (now, ms)) in
+      String.Table.set marketsummaries ms.symbol (now, ms) ;
+      on_marketsummary_update now old_ms ms ;
     end
 
-let rec loop_update_tickers () =
+let rec loop_update_mss () =
   Clock_ns.every
     ~continue_on_error:true
     (Time_ns.Span.of_int_sec 60)
-    (fun () -> RestSync.Default.push_nowait update_tickers)
+    (fun () -> RestSync.Default.push_nowait update_mss)
 
 let float_of_time ts = Int64.to_float (Int63.to_int64 (Time_ns.to_int63_ns_since_epoch ts)) /. 1e9
 let int64_of_time ts = Int64.(Int63.to_int64 (Time_ns.to_int63_ns_since_epoch ts) / 1_000_000_000L)
