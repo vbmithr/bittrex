@@ -1,7 +1,9 @@
 open Core
 open Async
 
-open Bittrex_async
+open Bs_devkit
+open Btrex
+open Btrex_async
 
 module Encoding = Dtc_pb.Encoding
 module DTC = Dtc_pb.Dtcprotocol_piqi
@@ -43,14 +45,14 @@ let margin_account = "margin"
 let update_client_span = ref @@ Time_ns.Span.of_int_sec 30
 let sc_mode = ref false
 
-let log_bttrex =
+let log_btrex =
   Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[stderr ()]
 let log_dtc =
   Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[stderr ()]
 
 let subid_to_sym : String.t Int.Table.t = Int.Table.create ()
 
-let currencies : Rest.Currency.t String.Table.t = String.Table.create ()
+let currencies : Currency.t String.Table.t = String.Table.create ()
 let tickers : (Time_ns.t * Ticker.t) String.Table.t = String.Table.create ()
 
 module Book = struct
@@ -74,28 +76,13 @@ module Book = struct
   let set_asks ~symbol ~ts ~book = String.Table.set asks ~key:symbol ~data:{ ts ; book }
 end
 
-let latest_trades : Trade.t String.Table.t = String.Table.create ()
+let latest_trades : MarketHistory.t String.Table.t = String.Table.create ()
 
 let buf_json = Bi_outbuf.create 4096
 
-let failure_of_error e =
-  match Error.to_exn e |> Monitor.extract_exn with
-  | Failure msg -> Some msg
-  | _ -> None
-
-let descr_of_symbol s =
-  let buf = Buffer.create 32 in
-  match String.split s ~on:'_' with
-  | [quote; base] ->
-    let quote = String.Table.find_exn currencies quote in
-    let base = String.Table.find_exn currencies base in
-    Buffer.add_string buf base.name;
-    Buffer.add_string buf " / ";
-    Buffer.add_string buf quote.name;
-    Buffer.contents buf
-  | _ -> invalid_argf "descr_of_symbol: %s" s ()
-
-let secdef_of_ticker ?request_id ?(final=true) t =
+let secdef_of_ticker ?request_id ?(final=true)
+    ({ symbol; quote; base; quote_descr; base_descr; ticksize; active; created } : Market.t) =
+  let description = quote_descr ^ " / " ^ base_descr in
   let request_id = match request_id with
     | Some reqid -> reqid
     | None when !sc_mode -> 110_000_000l
@@ -103,10 +90,10 @@ let secdef_of_ticker ?request_id ?(final=true) t =
   let secdef = DTC.default_security_definition_response () in
   secdef.request_id <- Some request_id ;
   secdef.is_final_message <- Some final ;
-  secdef.symbol <- Some t.Ticker.symbol ;
+  secdef.symbol <- Some symbol ;
   secdef.exchange <- Some my_exchange ;
   secdef.security_type <- Some `security_type_forex ;
-  secdef.description <- Some (descr_of_symbol t.symbol) ;
+  secdef.description <- Some description ;
   secdef.min_price_increment <- Some 1e-8 ;
   secdef.currency_value_per_increment <- Some 1e-8 ;
   secdef.price_display_format <- Some `price_display_format_decimal_8 ;
@@ -189,26 +176,43 @@ end = struct
   end
 end
 
+module ROSet = struct
+  include Caml.Set.Make(struct
+    include RespObj
+    let compare a b =
+      String.compare (string_exn a "OrderUuid") (string_exn b "OrderUuid")
+  end)
+
+  let of_table t =
+    Uuid.Table.fold t ~init:empty ~f:(fun ~key:_ ~data a -> add data a)
+
+  let to_table t =
+    let table = Uuid.Table.create () in
+    iter begin fun ro ->
+      let key = RespObj.string_exn ro "OrderUuid" |> Uuid.of_string in
+      Uuid.Table.set table key ro
+    end t ;
+    table
+end
+
 module Connection = struct
   type t = {
     addr: string;
     w: Writer.t;
-    key: string;
-    secret: string;
+    key : string ;
+    secret : string ;
     mutable dropped: int;
     subs: Int32.t String.Table.t;
     rev_subs : string Int32.Table.t;
     subs_depth: Int32.t String.Table.t;
     rev_subs_depth : string Int32.Table.t;
     (* Balances *)
-    b_exchange: Rest.Balance.t String.Table.t;
+    b_exchange: Balance.t String.Table.t;
     b_margin: Float.t String.Table.t;
-    mutable margin: Rest.MarginAccountSummary.t;
     (* Orders & Trades *)
     client_orders : DTC.Submit_new_single_order.t Int.Table.t ;
-    orders: (string * Rest.OpenOrder.t) Int.Table.t;
-    trades: Rest.TradeHistory.Set.t String.Table.t;
-    positions: Rest.MarginPosition.t String.Table.t;
+    mutable orders: RespObj.t Uuid.Table.t;
+    mutable trades: RespObj.t Uuid.Table.t;
     send_secdefs : bool ;
   }
 
@@ -221,84 +225,29 @@ module Connection = struct
 
   let iter = String.Table.iter active
 
-  let write_position_update ?(price=0.) ?(qty=0.) w symbol =
-    let update = DTC.default_position_update () in
-    update.trade_account <- Some margin_account ;
-    update.total_number_messages <- Some 1l ;
-    update.message_number <- Some 1l ;
-    update.symbol <- Some symbol ;
-    update.exchange <- Some my_exchange ;
-    update.quantity <- Some qty ;
-    update.average_price <- Some price ;
-    update.unsolicited <- Some true ;
-    write_message w `position_update DTC.gen_position_update update
-
-  let update_positions { addr; w; key; secret; positions } =
-    Rest.margin_positions ~buf:buf_json ~key ~secret () >>| function
-    | Error err ->
-      Log.error log_bttrex "update positions (%s): %s"
-        addr @@ Rest.Http_error.to_string err
-    | Ok ps -> List.iter ps ~f:begin fun (symbol, p) ->
-        match p with
-        | None ->
-          String.Table.remove positions symbol ;
-          write_position_update w symbol
-        | Some ({ price; qty; total; pl; lending_fees; side } as p) ->
-          String.Table.set positions ~key:symbol ~data:p ;
-          write_position_update w symbol ~price ~qty:(qty *. 1e4)
-      end
-
-  let update_orders { addr ; key; secret; orders } =
-    Rest.open_orders ~buf:buf_json ~key ~secret () >>| function
+  let update_orders ({ addr ; key ; secret } as c) =
+    openorders ~key ~secret ~buf:buf_json () >>| function
     | Error err ->
       Log.error log_btrex
-        "update orders (%s): %s" addr @@ Rest.Http_error.to_string err
-    | Ok os ->
-      Int.Table.clear orders;
-      List.iter os ~f:begin fun (symbol, os) ->
-        List.iter os ~f:begin fun o ->
-          Log.debug log_dtc "<- [%s] Add %d in order table" addr o.id ;
-          Int.Table.set orders o.id (symbol, o)
-        end
-      end
+        "update orders (%s): %s" addr @@ RestError.to_string err
+    | Ok (resp, orders) ->
+      let orders = List.map orders ~f:RespObj.of_json in
+      c.orders <- ROSet.(of_list orders |> to_table)
 
-  let update_trades { addr; key; secret; trades } =
-    Rest.trade_history ~buf:buf_json ~key ~secret () >>| function
+  let update_trades ({ addr ; key ; secret ; trades } as c) =
+    orderhistory ~buf:buf_json ~key ~secret () >>| function
     | Error err ->
       Log.error log_btrex
-        "update trades (%s): %s" addr (Rest.Http_error.to_string err)
-    | Ok ts ->
-      List.iter ts ~f:begin fun (symbol, ts) ->
-        let old_ts =
-          String.Table.find trades symbol |>
-          Option.value ~default:Rest.TradeHistory.Set.empty in
-        let cur_ts = Rest.TradeHistory.Set.of_list ts in
-        let new_ts = Rest.TradeHistory.Set.diff cur_ts old_ts in
-        String.Table.set trades symbol cur_ts;
-        Rest.TradeHistory.Set.iter new_ts ~f:ignore (* TODO: send order update messages *)
-      end
+        "update trades (%s): %s" addr (RestError.to_string err)
+    | Ok (resp, newtrades) ->
+      let newtrades = List.map newtrades ~f:RespObj.of_json in
+      let old_ts = ROSet.of_table trades in
+      let cur_ts = ROSet.of_list newtrades in
+      let new_ts = ROSet.diff cur_ts old_ts in
+      c.trades <- ROSet.to_table cur_ts ;
+      ROSet.iter ignore new_ts (* TODO: send order update messages *)
 
-  let write_margin_balance
-      ?request_id
-      ?(nb_msgs=1)
-      ?(msg_number=1) { addr; w; b_margin; margin } =
-    let securities_value = margin.net_value *. 1e3 in
-    let balance = DTC.default_account_balance_update () in
-    balance.request_id <- request_id ;
-    balance.cash_balance <- Some (margin.total_value *. 1e3) ;
-    balance.securities_value <- Some securities_value ;
-    balance.margin_requirement <- Some (margin.total_borrowed_value *. 1e3 *. 0.2) ;
-    balance.balance_available_for_new_positions <-
-      Some (securities_value /. 0.4 -. margin.total_borrowed_value *. 1e3) ;
-    balance.account_currency <- Some "mBTC" ;
-    balance.total_number_messages <- Int32.of_int nb_msgs ;
-    balance.message_number <- Int32.of_int msg_number ;
-    balance.trade_account <- Some margin_account ;
-    write_message w `account_balance_update DTC.gen_account_balance_update balance ;
-    Log.debug log_dtc "-> %s AccountBalanceUpdate %s (%d/%d)"
-      addr margin_account msg_number nb_msgs
-
-  let write_exchange_balance
+  let write_balance
       ?request_id
       ?(nb_msgs=1)
       ?(msg_number=1) { addr; w; b_exchange } =
@@ -325,26 +274,8 @@ module Connection = struct
     Log.debug log_dtc "-> %s AccountBalanceUpdate %s (%d/%d)"
       addr exchange_account msg_number nb_msgs
 
-  let update_margin ({ key ; secret } as conn) =
-    Rest.margin_account_summary ~buf:buf_json ~key ~secret () >>| function
-    | Error err ->
-      Log.error log_btrex "%s" @@ Rest.Http_error.to_string err
-    | Ok m ->
-      conn.margin <- m
-
-  let update_positive_balances ({ key ; secret ; b_margin } as conn) =
-    Rest.positive_balances ~buf:buf_json ~key ~secret () >>| function
-    | Error err -> Log.error log_btrex "%s" @@ Rest.Http_error.to_string err
-    | Ok bs ->
-      String.Table.clear b_margin;
-      List.Assoc.find ~equal:(=) bs Margin |>
-      Option.iter ~f:begin
-        List.iter ~f:(fun (c, b) -> String.Table.add_exn b_margin c b)
-      end ;
-      write_margin_balance conn
-
   let update_balances ({ key ; secret ; b_exchange } as conn) =
-    Rest.balances ~buf:buf_json ~all:false ~key ~secret () >>| function
+    balances ~buf:buf_json ~all:false ~key ~secret () >>| function
     | Error err -> Log.error log_btrex "%s" @@ Rest.Http_error.to_string err
     | Ok bs ->
       String.Table.clear b_exchange;
@@ -358,11 +289,8 @@ module Connection = struct
       span
       begin fun () ->
         let open RestSync.Default in
-        push_nowait (fun () -> update_positions conn) ;
         push_nowait (fun () -> update_orders conn) ;
         push_nowait (fun () -> update_trades conn) ;
-        push_nowait (fun () -> update_margin conn) ;
-        push_nowait (fun () -> update_positive_balances conn) ;
         push_nowait (fun () -> update_balances conn) ;
       end
 
@@ -380,11 +308,9 @@ module Connection = struct
       rev_subs_depth = Int32.Table.create () ;
       b_exchange = String.Table.create () ;
       b_margin = String.Table.create () ;
-      margin = Rest.MarginAccountSummary.empty ;
       client_orders = Int.Table.create () ;
-      orders = Int.Table.create () ;
-      trades = String.Table.create () ;
-      positions = String.Table.create () ;
+      orders = Uuid.Table.create () ;
+      trades = Uuid.Table.create () ;
     } in
     set ~key:addr ~data:conn ;
     if key = "" || secret = "" then Deferred.return false
