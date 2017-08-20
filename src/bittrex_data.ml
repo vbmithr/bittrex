@@ -6,8 +6,8 @@ open Log.Global
 open Cohttp_async
 
 open Bs_devkit
-open Bittrex
-module REST = Bittrex_async
+open Btrex
+module REST = Btrex_async
 module DTC = Dtc_pb.Dtcprotocol_piqi
 
 module DB = struct

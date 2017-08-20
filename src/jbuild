@@ -1,6 +1,15 @@
-(executables
- ((names (bittrex_data bittrex))
-  (public_names (bittrex-data bittrex))
-  (modules (bittrex_data bittrex))
+(executable
+ ((name bittrex_data)
+  (public_name bittrex-data)
+  (modules (bittrex_data))
   (preprocess (pps (ppx_sexp_conv)))
+  (package bittrex-data)
+  (libraries (bitv bs-devkit leveldb tick dtc-pb btrex btrex-async))))
+
+(executable
+ ((name bittrex)
+  (public_name bittrex)
+  (modules (bittrex))
+  (preprocess (pps (ppx_sexp_conv)))
+  (package bittrex)
   (libraries (bitv bs-devkit leveldb tick dtc-pb btrex btrex-async))))
